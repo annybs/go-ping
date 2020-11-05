@@ -13,14 +13,27 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
+// Packet @todo comment
+type Packet struct {
+	bytes []byte
+	size  int
+	ttl   int
+}
+
 // Pinger @todo comment
 type Pinger struct {
-	Count    int
+	// Number of packets to send. Default is -1 for no limit.
+	Count int
+	// Interval between packets sent. Default is 1 second.
 	Interval time.Duration
 
-	address         string
-	network         string
-	originalAddress net.Addr
+	// Packet loss side effect. Called when a packet is lost. Default is nil.
+	OnLost func()
+	// Packet receiver side effect. Called when a packet is received. Default is nil.
+	OnReceive func(*Packet)
+
+	addr  net.Addr
+	raddr *pingerDef
 
 	ctx        context.Context
 	done       chan bool
@@ -34,10 +47,12 @@ type Statistics struct {
 	PacketsSent     int
 }
 
-type packet struct {
-	bytes []byte
-	size  int
-	ttl   int
+type pingerDef struct {
+	address string
+	network string
+
+	messageType icmp.Type
+	protocol    int
 }
 
 // New @todo comment
@@ -46,7 +61,7 @@ func New(ctx context.Context, a net.Addr) (p *Pinger, err error) {
 	if err != nil {
 		return
 	}
-	network, address, err := resolve(a)
+	def, err := resolve(a)
 	if err != nil {
 		return
 	}
@@ -55,9 +70,8 @@ func New(ctx context.Context, a net.Addr) (p *Pinger, err error) {
 		Count:    -1,
 		Interval: time.Second,
 
-		address:         address,
-		network:         network,
-		originalAddress: a,
+		addr:  a,
+		raddr: def,
 
 		ctx:  ctx,
 		done: make(chan bool, 1),
@@ -67,25 +81,25 @@ func New(ctx context.Context, a net.Addr) (p *Pinger, err error) {
 
 // Run @todo comment
 func (p *Pinger) Run() (s *Statistics, err error) {
-	c, err := icmp.ListenPacket(p.network, p.address)
+	c, err := icmp.ListenPacket(p.raddr.network, p.raddr.address)
 	if err != nil {
 		err = fmt.Errorf("Error creating a packet listener: %s", err)
 		return
 	}
 	defer c.Close()
 
-	s = newStatistics()
-	p.statistics = s
-
 	defer func() {
 		close(p.done)
 	}()
 
-	var pkts chan *packet
-	if p.Count > -1 {
-		pkts = make(chan *packet, p.Count)
+	var pkts chan *Packet
+	if p.Count == -1 {
+		pkts = make(chan *Packet)
+	} else if p.Count > 0 {
+		pkts = make(chan *Packet, p.Count)
 	} else {
-		pkts = make(chan *packet)
+		err = fmt.Errorf("Invalid Pinger.Count: must be -1 or >0")
+		return
 	}
 	defer func() {
 		close(pkts)
@@ -96,6 +110,9 @@ func (p *Pinger) Run() (s *Statistics, err error) {
 		interval.Stop()
 	}()
 
+	s = newStatistics()
+	p.statistics = s
+
 	for {
 		select {
 		case <-interval.C:
@@ -103,6 +120,7 @@ func (p *Pinger) Run() (s *Statistics, err error) {
 				err = p.send(c, pkts)
 				if err != nil {
 					err = fmt.Errorf("Error sending a packet: %s", err)
+					p.lost()
 					return
 				}
 			}
@@ -135,54 +153,31 @@ func canPing() (err error) {
 }
 
 func (p *Pinger) canReceive() bool {
-	return p.Count < 0 || p.statistics.PacketsReceived < p.Count
+	return p.Count == -1 || p.statistics.PacketsReceived < p.Count
 }
 
 func (p *Pinger) canSend() bool {
-	return p.Count < 0 || p.statistics.PacketsSent < p.Count
+	return p.Count == -1 || p.statistics.PacketsSent < p.Count
 }
 
-func (p *Pinger) messageType() (t icmp.Type, err error) {
-	switch p.network {
-	case "ip4:icmp":
-		t = ipv4.ICMPTypeExtendedEchoRequest
-	case "ip6:ipv6-icmp":
-		t = ipv6.ICMPTypeEchoRequest
-	default:
-		err = fmt.Errorf("Message type unknown")
+func (p *Pinger) lost() {
+	p.statistics.PacketsLost++
+	if p.OnLost != nil {
+		p.OnLost()
 	}
-	return
 }
 
-func (p *Pinger) protocol() (proto int, err error) {
-	switch p.network {
-	case "ip4:icmp":
-		proto = 1
-	case "ip6:ipv6-icmp":
-		proto = 58
-	default:
-		err = fmt.Errorf("Protocol unknown")
-	}
-	return
-}
-
-func (p *Pinger) receive(pkt *packet) error {
+func (p *Pinger) receive(pkt *Packet) error {
 	p.statistics.PacketsReceived++
+	if p.OnReceive != nil {
+		p.OnReceive(pkt)
+	}
 	return nil
 }
 
-func (p *Pinger) send(c *icmp.PacketConn, pkts chan<- *packet) (err error) {
-	msgType, err := p.messageType()
-	if err != nil {
-		return
-	}
-	proto, err := p.protocol()
-	if err != nil {
-		return
-	}
-
+func (p *Pinger) send(c *icmp.PacketConn, pkts chan<- *Packet) (err error) {
 	msg := icmp.Message{
-		Type: msgType,
+		Type: p.raddr.messageType,
 		Code: 0,
 		Body: &icmp.Echo{
 			ID:   os.Getpid() & 0xffff,
@@ -196,30 +191,22 @@ func (p *Pinger) send(c *icmp.PacketConn, pkts chan<- *packet) (err error) {
 		return
 	}
 	p.statistics.PacketsSent++
-	_, err = c.WriteTo(msgBytes, p.originalAddress)
+	_, err = c.WriteTo(msgBytes, p.addr)
 	if err != nil {
 		return
 	}
 
 	rbytes := make([]byte, 512)
-	n, peer, err := c.ReadFrom(rbytes)
+	n, _, err := c.ReadFrom(rbytes)
 	if err != nil {
 		return
 	}
-	rmsg, err := icmp.ParseMessage(proto, rbytes[:n])
-	if err != nil {
-		return
+
+	pkts <- &Packet{
+		bytes: rbytes,
+		size:  n,
+		ttl:   0,
 	}
-	// switch rm.Type {
-	// case ipv6.ICMPTypeEchoReply:
-
-	// }
-
-	// pkt := &packet{
-	// 	bytes: make([]byte, 512),
-	// 	size:  512,
-	// 	ttl:   0,
-	// }
 	return
 }
 
@@ -239,16 +226,26 @@ func newStatistics() *Statistics {
 	}
 }
 
-func resolve(a net.Addr) (network, address string, err error) {
+func resolve(a net.Addr) (*pingerDef, error) {
+	var network, address string
+	var messageType icmp.Type
+	var protocol int
+	var err error
+
 	switch a.Network() {
 	case "ip":
 		address = a.String()
 		ip := a.(*net.IPAddr).IP
-		if isIPv4(ip) {
+		switch {
+		case isIPv4(ip):
 			network = "ip4:icmp"
-		} else if isIPv6(ip) {
+			messageType = ipv4.ICMPTypeExtendedEchoRequest
+			protocol = 1
+		case isIPv6(ip):
 			network = "ip6:ipv6-icmp"
-		} else {
+			messageType = ipv6.ICMPTypeEchoRequest
+			protocol = 58
+		default:
 			err = fmt.Errorf("Invalid address \"%s\"", a.String())
 		}
 	// case "udp":
@@ -264,5 +261,15 @@ func resolve(a net.Addr) (network, address string, err error) {
 	default:
 		err = fmt.Errorf("Unsupported network type: \"%s\"", a.Network())
 	}
-	return
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &pingerDef{
+		address:     address,
+		network:     network,
+		messageType: messageType,
+		protocol:    protocol,
+	}, nil
 }
