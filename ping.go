@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"runtime"
 	"time"
 
 	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // Pinger @todo comment
@@ -38,6 +42,10 @@ type packet struct {
 
 // New @todo comment
 func New(ctx context.Context, a net.Addr) (p *Pinger, err error) {
+	err = canPing()
+	if err != nil {
+		return
+	}
 	network, address, err := resolve(a)
 	if err != nil {
 		return
@@ -51,19 +59,14 @@ func New(ctx context.Context, a net.Addr) (p *Pinger, err error) {
 		network:         network,
 		originalAddress: a,
 
-		ctx:        ctx,
-		done:       make(chan bool, 1),
-		statistics: newStatistics(),
+		ctx:  ctx,
+		done: make(chan bool, 1),
 	}
 	return
 }
 
 // Run @todo comment
 func (p *Pinger) Run() (s *Statistics, err error) {
-	if err != nil {
-		err = fmt.Errorf("Error resolving network address: %s", err)
-		return
-	}
 	c, err := icmp.ListenPacket(p.network, p.address)
 	if err != nil {
 		err = fmt.Errorf("Error creating a packet listener: %s", err)
@@ -71,13 +74,19 @@ func (p *Pinger) Run() (s *Statistics, err error) {
 	}
 	defer c.Close()
 
-	s = p.statistics
+	s = newStatistics()
+	p.statistics = s
 
 	defer func() {
 		close(p.done)
 	}()
 
-	pkts := make(chan *packet, p.Count)
+	var pkts chan *packet
+	if p.Count > -1 {
+		pkts = make(chan *packet, p.Count)
+	} else {
+		pkts = make(chan *packet)
+	}
 	defer func() {
 		close(pkts)
 	}()
@@ -91,15 +100,10 @@ func (p *Pinger) Run() (s *Statistics, err error) {
 		select {
 		case <-interval.C:
 			if p.canSend() {
-				err = p.send()
+				err = p.send(c, pkts)
 				if err != nil {
 					err = fmt.Errorf("Error sending a packet: %s", err)
 					return
-				}
-				pkts <- &packet{
-					bytes: make([]byte, 512),
-					size:  512,
-					ttl:   0,
 				}
 			}
 		case pkt := <-pkts:
@@ -120,14 +124,46 @@ func (p *Pinger) Run() (s *Statistics, err error) {
 	}
 }
 
+func canPing() (err error) {
+	switch runtime.GOOS {
+	case "darwin", "ios":
+	case "linux":
+	default:
+		err = fmt.Errorf("ping not supported on %s", runtime.GOOS)
+	}
+	return
+}
+
 func (p *Pinger) canReceive() bool {
-	fmt.Println("Receive")
 	return p.Count < 0 || p.statistics.PacketsReceived < p.Count
 }
 
 func (p *Pinger) canSend() bool {
-	fmt.Println("Send")
 	return p.Count < 0 || p.statistics.PacketsSent < p.Count
+}
+
+func (p *Pinger) messageType() (t icmp.Type, err error) {
+	switch p.network {
+	case "ip4:icmp":
+		t = ipv4.ICMPTypeExtendedEchoRequest
+	case "ip6:ipv6-icmp":
+		t = ipv6.ICMPTypeEchoRequest
+	default:
+		err = fmt.Errorf("Message type unknown")
+	}
+	return
+}
+
+func (p *Pinger) protocol() (proto int, err error) {
+	switch p.network {
+	case "ip4:icmp":
+		proto = 1
+	case "ip6:ipv6-icmp":
+		proto = 58
+	default:
+		err = fmt.Errorf("Protocol unknown")
+	}
+	return
 }
 
 func (p *Pinger) receive(pkt *packet) error {
@@ -135,9 +171,56 @@ func (p *Pinger) receive(pkt *packet) error {
 	return nil
 }
 
-func (p *Pinger) send() error {
+func (p *Pinger) send(c *icmp.PacketConn, pkts chan<- *packet) (err error) {
+	msgType, err := p.messageType()
+	if err != nil {
+		return
+	}
+	proto, err := p.protocol()
+	if err != nil {
+		return
+	}
+
+	msg := icmp.Message{
+		Type: msgType,
+		Code: 0,
+		Body: &icmp.Echo{
+			ID:   os.Getpid() & 0xffff,
+			Seq:  p.statistics.PacketsSent + 1,
+			Data: []byte("HELLO"),
+		},
+	}
+
+	msgBytes, err := msg.Marshal(nil)
+	if err != nil {
+		return
+	}
 	p.statistics.PacketsSent++
-	return nil
+	_, err = c.WriteTo(msgBytes, p.originalAddress)
+	if err != nil {
+		return
+	}
+
+	rbytes := make([]byte, 512)
+	n, peer, err := c.ReadFrom(rbytes)
+	if err != nil {
+		return
+	}
+	rmsg, err := icmp.ParseMessage(proto, rbytes[:n])
+	if err != nil {
+		return
+	}
+	// switch rm.Type {
+	// case ipv6.ICMPTypeEchoReply:
+
+	// }
+
+	// pkt := &packet{
+	// 	bytes: make([]byte, 512),
+	// 	size:  512,
+	// 	ttl:   0,
+	// }
+	return
 }
 
 func isIPv4(ip net.IP) bool {
@@ -157,8 +240,8 @@ func newStatistics() *Statistics {
 }
 
 func resolve(a net.Addr) (network, address string, err error) {
-	switch {
-	case a.Network() == "ip":
+	switch a.Network() {
+	case "ip":
 		address = a.String()
 		ip := a.(*net.IPAddr).IP
 		if isIPv4(ip) {
@@ -168,16 +251,16 @@ func resolve(a net.Addr) (network, address string, err error) {
 		} else {
 			err = fmt.Errorf("Invalid address \"%s\"", a.String())
 		}
-	case a.Network() == "udp":
-		address = a.String()
-		ip := a.(*net.UDPAddr).IP
-		if isIPv4(ip) {
-			network = "udp4"
-		} else if isIPv6(ip) {
-			network = "udp6"
-		} else {
-			err = fmt.Errorf("Invalid address \"%s\"", a.String())
-		}
+	// case "udp":
+	// 	address = a.String()
+	// 	ip := a.(*net.UDPAddr).IP
+	// 	if isIPv4(ip) {
+	// 		network = "udp4"
+	// 	} else if isIPv6(ip) {
+	// 		network = "udp6"
+	// 	} else {
+	// 		err = fmt.Errorf("Invalid address \"%s\"", a.String())
+	// 	}
 	default:
 		err = fmt.Errorf("Unsupported network type: \"%s\"", a.Network())
 	}
