@@ -248,16 +248,20 @@ func resolve(a net.Addr) (*pingerDef, error) {
 		default:
 			err = fmt.Errorf("Invalid address \"%s\"", a.String())
 		}
-	// case "udp":
-	// 	address = a.String()
-	// 	ip := a.(*net.UDPAddr).IP
-	// 	if isIPv4(ip) {
-	// 		network = "udp4"
-	// 	} else if isIPv6(ip) {
-	// 		network = "udp6"
-	// 	} else {
-	// 		err = fmt.Errorf("Invalid address \"%s\"", a.String())
-	// 	}
+	case "udp":
+		address = a.String()
+		ip := a.(*net.UDPAddr).IP
+		if isIPv4(ip) {
+			network = "udp4"
+			messageType = ipv4.ICMPTypeExtendedEchoRequest
+			protocol = 1
+		} else if isIPv6(ip) {
+			network = "udp6"
+			messageType = ipv6.ICMPTypeEchoRequest
+			protocol = 58
+		} else {
+			err = fmt.Errorf("Invalid address \"%s\"", a.String())
+		}
 	default:
 		err = fmt.Errorf("Unsupported network type: \"%s\"", a.Network())
 	}

@@ -13,6 +13,7 @@ import (
 const (
 	runInterval = 500 * time.Millisecond
 	runTimeout  = 5 * time.Second
+	udpTestPort = 9009
 )
 
 func TestIPv4(t *testing.T) {
@@ -21,6 +22,27 @@ func TestIPv4(t *testing.T) {
 		IP: net.ParseIP("127.0.0.1"),
 	}
 	_, err := pingOnce(a)
+	assert.Nil(t, err)
+}
+
+func TestIPv4UDP(t *testing.T) {
+	fmt.Println("Test IPv4 ping with UDP")
+
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: udpTestPort,
+	})
+	if err != nil {
+		assert.NotNil(t, err)
+		return
+	}
+	defer c.Close()
+
+	a := &net.UDPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: udpTestPort,
+	}
+	_, err = pingOnce(a)
 	assert.Nil(t, err)
 }
 
