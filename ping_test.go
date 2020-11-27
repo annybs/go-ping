@@ -28,22 +28,28 @@ func TestIPv4(t *testing.T) {
 func TestIPv4UDP(t *testing.T) {
 	fmt.Println("Test IPv4 ping with UDP")
 
+	// done := make(chan bool, 1)
+
 	c, err := net.ListenUDP("udp4", &net.UDPAddr{
-		IP:   net.ParseIP("127.0.0.1"),
-		Port: udpTestPort,
+		IP: net.ParseIP("127.0.0.1"),
 	})
 	if err != nil {
-		assert.NotNil(t, err)
+		assert.Nil(t, err)
 		return
 	}
 	defer c.Close()
 
+	port := c.LocalAddr().(*net.UDPAddr).Port
+	fmt.Printf("Simple UDP server listening on port %d\n", port)
+
 	a := &net.UDPAddr{
 		IP:   net.ParseIP("127.0.0.1"),
-		Port: udpTestPort,
+		Port: port,
 	}
 	_, err = pingOnce(a)
 	assert.Nil(t, err)
+
+	// <-done
 }
 
 func TestCancelIPv4(t *testing.T) {
